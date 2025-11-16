@@ -1,4 +1,7 @@
 # main.py
+from cryptography.fernet import Fernet
+import base64
+import requests
 from fastapi.responses import RedirectResponse
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -83,6 +86,7 @@ class TrackVerboseInfo(BaseModel):
     spotify_url: str
     spotify_uri: str
 
+
 class UserInfo(BaseModel):
     display_name: str
     uri: str
@@ -104,6 +108,7 @@ class ArtistInfo(BaseModel):
     image_url: str | None
     followers: int
 
+
 class RecentlyPlayedTrack(BaseModel):
     id: str
     name: str
@@ -113,30 +118,91 @@ class RecentlyPlayedTrack(BaseModel):
     spotify_url: str
     played_at: str
 
+
+class PlaylistInfo(BaseModel):
+    id: str
+    name: str
+    description: str | None
+    public: bool
+    collaborative: bool
+    owner: str
+    tracks_total: int
+    spotify_url: str
+    image_url: str | None
+
 # ---------------------
 # Helper Functions
 # ---------------------
 
 
+# Setup encryption
+ENCRYPTION_KEY = os.environ.get(
+    "ENCRYPTION_KEY").encode()  # store safely in env
+fernet = Fernet(ENCRYPTION_KEY)
+
+
 def save_token(token_info: dict):
-    r.set("spotify_token", json.dumps(token_info))
+    """Save access token with TTL and refresh token separately, encrypted."""
+    access_token = token_info.get("access_token")
+    refresh_token = token_info.get("refresh_token")
+    expires_in = token_info.get("expires_in", 3600)
+
+    if access_token:
+        encrypted_access = fernet.encrypt(access_token.encode()).decode()
+        r.set("spotify_access_token", encrypted_access, ex=expires_in)
+
+    if refresh_token:
+        encrypted_refresh = fernet.encrypt(refresh_token.encode()).decode()
+        r.set("spotify_refresh_token", encrypted_refresh)
 
 
-def load_token():
-    token = r.get("spotify_token")
-    return json.loads(token) if token else None
+def refresh_access_token():
+    """Refresh the Spotify access token safely with Redis lock, decrypting the refresh token."""
+    encrypted_refresh = r.get("spotify_refresh_token")
+    if not encrypted_refresh:
+        raise RuntimeError("No refresh token available in Redis")
+
+    refresh_token = fernet.decrypt(encrypted_refresh.encode()).decode()
+
+    with r.lock("spotify_refresh_lock", timeout=30, blocking_timeout=5):
+        # Double-check in case another process refreshed while waiting
+        encrypted_access = r.get("spotify_access_token")
+        if encrypted_access:
+            return fernet.decrypt(encrypted_access.encode()).decode()
+
+        # Request new access token from Spotify
+        auth_header = base64.b64encode(
+            f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+        response = requests.post(
+            "https://accounts.spotify.com/api/token",
+            headers={"Authorization": f"Basic {auth_header}"},
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Failed to refresh token: {response.text}")
+
+        token_info = response.json()
+        save_token(token_info)
+        return token_info["access_token"]
+
+
+def get_valid_token():
+    """Return a valid Spotify access token, refreshing if expired."""
+    encrypted_access = r.get("spotify_access_token")
+    if encrypted_access:
+        return fernet.decrypt(encrypted_access.encode()).decode()
+    return refresh_access_token()
 
 
 def get_spotify_client():
-    token_info = load_token()
-    if not token_info:
+    """Return a Spotify client with a valid token."""
+    token = get_valid_token()
+    if not token:
         return None
-    if sp_oauth.is_token_expired(token_info):
-        token_info = sp_oauth.refresh_access_token(token_info["refresh_token"])
-        save_token(token_info)
-    return Spotify(auth=token_info["access_token"])
-
-
+    return Spotify(auth=token)
 # ---------------------
 # Routes
 # ---------------------
@@ -157,7 +223,8 @@ def index():
     try:
         auth_url = sp_oauth.get_authorize_url()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create auth URL: {e}")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create auth URL: {e}")
     return RedirectResponse(auth_url)
 
 
@@ -184,7 +251,8 @@ def callback(request: Request):
     try:
         token_info = sp_oauth.get_access_token(code, as_dict=True)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Failed to exchange code for token: {e}")
+        raise HTTPException(
+            status_code=502, detail=f"Failed to exchange code for token: {e}")
 
     save_token(token_info)
 
@@ -217,6 +285,11 @@ def currently_playing():
         results = sp.current_playback()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Spotify API error: {e}")
+
+    is_private = results.get("device", {}).get("is_private_session", False)
+    if is_private:
+        return RedirectResponse(status_code=204, url="/currently-playing-verbose")
+
     if results and results.get("item") and results.get("is_playing"):
         track = results["item"]
         return {"artists": [artist["name"] for artist in track["artists"]], "track": track["name"]}
@@ -249,6 +322,11 @@ def currently_playing_verbose():
         results = sp.current_playback()
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Spotify API error: {e}")
+
+    is_private = results.get("device", {}).get("is_private_session", False)
+    if is_private:
+        return RedirectResponse(status_code=204, url="/currently-playing-verbose")
+
     if results and results.get("item") and results.get("is_playing"):
         track = results["item"]
         track_id = track["id"]
@@ -323,7 +401,8 @@ def top_five():
     if not sp:
         raise HTTPException(status_code=401, detail="Spotify token not found")
     try:
-        top_tracks = sp.current_user_top_tracks(limit=5, time_range="short_term")
+        top_tracks = sp.current_user_top_tracks(
+            limit=5, time_range="short_term")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Spotify API error: {e}")
     return {"top_tracks": top_tracks['items']}
@@ -350,7 +429,8 @@ def top_five_artists():
     if not sp:
         raise HTTPException(status_code=401, detail="Spotify token not found")
     try:
-        top_artists = sp.current_user_top_artists(limit=5, time_range="short_term")
+        top_artists = sp.current_user_top_artists(
+            limit=5, time_range="short_term")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Spotify API error: {e}")
 
@@ -413,5 +493,53 @@ def recently_played(limit: int = 5):
                 played_at=item.get("played_at"),
             )
         )
+
+    return items
+
+
+@app.get(
+    "/my-playlists",
+    response_model=list[PlaylistInfo],
+    summary="Get user's public playlists",
+    description=(
+        "Returns the authenticated user's public playlists. "
+        "Uses Spotify's `current_user_playlists` endpoint."
+    ),
+    responses={
+        200: {"description": "OK - list of public playlists", "model": list[PlaylistInfo]},
+        401: {"model": ErrorResponse, "description": "Unauthorized - no token"},
+        502: {"model": ErrorResponse, "description": "Upstream Spotify error"},
+    },
+    tags=["playlists"],
+)
+def my_playlists(limit: int = 5):
+    """Return the user's public playlists."""
+    sp = get_spotify_client()
+    if not sp:
+        raise HTTPException(status_code=401, detail="Spotify token not found")
+
+    try:
+        results = sp.current_user_playlists()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Spotify API error: {e}")
+
+    items = []
+    for playlist in results.get("items", [])[:limit]:
+        # Only include public playlists
+        if playlist.get("public"):
+            items.append(
+                PlaylistInfo(
+                    id=playlist["id"],
+                    name=playlist["name"],
+                    description=playlist.get("description"),
+                    public=playlist["public"],
+                    collaborative=playlist.get("collaborative", False),
+                    owner=playlist["owner"]["display_name"],
+                    tracks_total=playlist["tracks"]["total"],
+                    spotify_url=playlist["external_urls"]["spotify"],
+                    image_url=playlist["images"][0]["url"] if playlist.get(
+                        "images") else None,
+                )
+            )
 
     return items
