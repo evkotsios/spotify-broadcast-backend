@@ -4,7 +4,7 @@ import base64
 from datetime import datetime, timezone
 import requests
 from fastapi.responses import RedirectResponse
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from fastapi import HTTPException
@@ -343,7 +343,7 @@ def currently_playing():
 
     is_private = results.get("device", {}).get("is_private_session", False)
     if is_private:
-        return RedirectResponse(status_code=204, url="/currently-playing-verbose")
+        return Response(status_code=204)
 
     if results and results.get("item") and results.get("is_playing"):
         track = results["item"]
@@ -352,7 +352,7 @@ def currently_playing():
             "track": track["name"],
         }
     # Nothing playing
-    return RedirectResponse(status_code=204, url="/currently-playing")
+    return Response(status_code=204)
 
 
 @app.get(
@@ -383,7 +383,7 @@ def currently_playing_verbose():
 
     is_private = results.get("device", {}).get("is_private_session", False)
     if is_private:
-        return RedirectResponse(status_code=204, url="/currently-playing-verbose")
+        return Response(status_code=204)
 
     if results and results.get("item") and results.get("is_playing"):
         track = results["item"]
@@ -402,7 +402,7 @@ def currently_playing_verbose():
             "track_id": track_id,
         }
     # Nothing playing
-    return RedirectResponse(status_code=204, url="/currently-playing-verbose")
+    return Response(status_code=204)
 
 
 @app.get(
@@ -803,14 +803,12 @@ def spotify_wrapped(period: str = "long_term"):
         raise HTTPException(status_code=502, detail=f"Spotify API error: {e}")
 
 
-@router.get("/api/heartbeat")
+@app.get("/api/heartbeat")
 async def heartbeat():
     try:
-        r = redis.from_url(REDIS_URL, socket_connect_timeout=5, socket_timeout=5)
-
         # get the previous heartbeat before overwriting it
         last = r.get("last_heartbeat")
-        last_str = last.decode() if last else None
+        last_str = last if last else None
 
         now = datetime.now(timezone.utc).isoformat()
         r.set("last_heartbeat", now)  # no expiry — we want this to persist
