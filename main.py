@@ -1,6 +1,7 @@
 # main.py
 from cryptography.fernet import Fernet
 import base64
+from datetime import datetime, timezone
 import requests
 from fastapi.responses import RedirectResponse
 from fastapi import FastAPI, Request
@@ -800,3 +801,37 @@ def spotify_wrapped(period: str = "long_term"):
 
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Spotify API error: {e}")
+
+
+@router.get("/api/heartbeat")
+async def heartbeat():
+    try:
+        r = redis.from_url(REDIS_URL, socket_connect_timeout=5, socket_timeout=5)
+
+        # get the previous heartbeat before overwriting it
+        last = r.get("last_heartbeat")
+        last_str = last.decode() if last else None
+
+        now = datetime.now(timezone.utc).isoformat()
+        r.set("last_heartbeat", now)  # no expiry — we want this to persist
+
+        return {
+            "status": "ok",
+            "message": "Redis is alive",
+            "current_heartbeat": now,
+            "previous_heartbeat": last_str,
+        }
+
+    except redis.exceptions.ConnectionError as e:
+        return {
+            "status": "error",
+            "message": "Could not connect to Redis",
+            "detail": str(e),
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "Unexpected error during heartbeat",
+            "detail": str(e),
+        }
